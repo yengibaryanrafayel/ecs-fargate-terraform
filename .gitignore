@@ -1,0 +1,28 @@
+# Terraform state & local cache
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.backup
+*.tfplan
+tfplan
+
+# Variable files with secrets
+*.tfvars
+!*.tfvars.example
+
+# Lambda build artifacts (region-suffixed, e.g. greeter-us-east-1.zip)
+modules/lambda/functions/*.zip
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# macOS
+.DS_Store
+
+# Editor directories
+.idea/
+.vscode/
+*.swp

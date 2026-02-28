@@ -1,0 +1,189 @@
+name: CI/CD — Unleash Live Infrastructure
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Action to run"
+        required: true
+        default: "apply"
+        type: choice
+        options: [apply, destroy]
+
+env:
+  TF_VERSION: "1.7.5"
+
+# ─────────────────────────────────────────────────────────────
+# Job 1 — Lint & Format
+# ─────────────────────────────────────────────────────────────
+jobs:
+  lint:
+    name: Lint & Validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: terraform fmt (check)
+        run: terraform fmt -check -recursive
+        # Fails if any .tf file is not formatted. Run `terraform fmt -recursive` locally to fix.
+
+      - name: terraform init (no backend)
+        run: terraform init -backend=false
+
+      - name: terraform validate
+        run: terraform validate
+
+# ─────────────────────────────────────────────────────────────
+# Job 2 — Security Scan
+# ─────────────────────────────────────────────────────────────
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: tfsec — static analysis
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          soft_fail: true   # advisory only; adjust to false to enforce
+
+      - name: Checkov — policy-as-code scan
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          framework: terraform
+          soft_fail: true
+
+# ─────────────────────────────────────────────────────────────
+# Job 3 — Plan (PR preview)
+# ─────────────────────────────────────────────────────────────
+  plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    needs: security
+    if: github.event_name == 'pull_request'
+    env:
+      AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION:    us-east-1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: terraform init
+        run: terraform init -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}"
+
+      - name: terraform plan
+        run: |
+          terraform plan -out=tfplan \
+            -var="email=${{ secrets.TF_EMAIL }}" \
+            -var="github_repo=${{ secrets.TF_GITHUB_REPO }}" \
+            -var="cognito_temp_password=${{ secrets.TF_COGNITO_PASSWORD }}"
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: tfplan
+          retention-days: 5
+
+# ─────────────────────────────────────────────────────────────
+# Job 4 — Apply (main branch push)
+# ─────────────────────────────────────────────────────────────
+  deploy:
+    name: Terraform Apply
+    runs-on: ubuntu-latest
+    needs: [lint, security]
+    if: >
+      github.event_name == 'push' && github.ref == 'refs/heads/main' ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply')
+    environment: production
+    env:
+      AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION:    us-east-1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: terraform init
+        run: terraform init -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}"
+
+      - name: terraform apply
+        run: |
+          terraform apply -auto-approve \
+            -var="email=${{ secrets.TF_EMAIL }}" \
+            -var="github_repo=${{ secrets.TF_GITHUB_REPO }}" \
+            -var="cognito_temp_password=${{ secrets.TF_COGNITO_PASSWORD }}"
+
+      - name: Capture Terraform outputs
+        id: tf
+        run: |
+          echo "us_api_url=$(terraform output -raw us_east_1_api_url)" >> "$GITHUB_OUTPUT"
+          echo "eu_api_url=$(terraform output -raw eu_west_1_api_url)"  >> "$GITHUB_OUTPUT"
+          echo "user_pool_id=$(terraform output -raw cognito_user_pool_id)" >> "$GITHUB_OUTPUT"
+          echo "client_id=$(terraform output -raw cognito_client_id)"   >> "$GITHUB_OUTPUT"
+
+      # ── Test Execution Placeholder ──────────────────────────
+      # Uncomment this step once AWS credentials are available in the runner.
+      # The script authenticates with Cognito, concurrently exercises /greet
+      # and /dispatch in both regions, and asserts region correctness.
+      #
+      # - name: Run integration tests
+      #   run: |
+      #     pip install --quiet boto3 requests
+      #     python scripts/test.py \
+      #       --us-api-url  "${{ steps.tf.outputs.us_api_url }}" \
+      #       --eu-api-url  "${{ steps.tf.outputs.eu_api_url }}" \
+      #       --user-pool-id "${{ steps.tf.outputs.user_pool_id }}" \
+      #       --client-id   "${{ steps.tf.outputs.client_id }}" \
+      #       --email       "${{ secrets.TF_EMAIL }}" \
+      #       --password    "${{ secrets.TF_COGNITO_PASSWORD }}"
+
+# ─────────────────────────────────────────────────────────────
+# Job 5 — Destroy (manual dispatch only — cost guard)
+# ─────────────────────────────────────────────────────────────
+  destroy:
+    name: Terraform Destroy
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'destroy'
+    environment: production
+    env:
+      AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION:    us-east-1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: terraform init
+        run: terraform init -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}"
+
+      - name: terraform destroy
+        run: |
+          terraform destroy -auto-approve \
+            -var="email=${{ secrets.TF_EMAIL }}" \
+            -var="github_repo=${{ secrets.TF_GITHUB_REPO }}" \
+            -var="cognito_temp_password=${{ secrets.TF_COGNITO_PASSWORD }}"
